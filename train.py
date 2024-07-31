@@ -13,7 +13,6 @@ Models:     https://github.com/ultralytics/yolov5/tree/master/models
 Datasets:   https://github.com/ultralytics/yolov5/tree/master/data
 Tutorial:   https://docs.ultralytics.com/yolov5/tutorials/train_custom_data
 """
-import binopsf
 import argparse
 import math
 import os
@@ -222,7 +221,6 @@ def train(hyp, opt, device, callbacks):
     else:
         model = Model(cfg, ch=3, nc=nc, anchors=hyp.get("anchors")).to(device)  # create
     amp = check_amp(model)  # check AMP
-    bin_op = binopsf.BinOp(model)
     # Freeze
     freeze = [f"model.{x}." for x in (freeze if len(freeze) > 1 else range(freeze[0]))]  # layers to freeze
     for k, v in model.named_parameters():
@@ -240,7 +238,28 @@ def train(hyp, opt, device, callbacks):
     if RANK == -1 and batch_size == -1:  # single-GPU only, estimate best batch size
         batch_size = check_train_batch_size(model, imgsz, amp)
         loggers.on_params_update({"batch_size": batch_size})
+    count_Conv2d = 0
+    for m in model.modules():
+        if isinstance(m, nn.Conv2d):
+            count_Conv2d = count_Conv2d + 1
 
+    start_range = 1
+    end_range = count_Conv2d-2
+    bin_range = np.linspace(start_range,
+            end_range, end_range-start_range+1)\
+                    .astype('int').tolist()
+    num_of_params = len(bin_range)
+    saved_params = []
+    target_params = []
+    target_modules = []
+    index = -1
+    for m in model.modules():
+        if isinstance(m, nn.Conv2d):
+            index = index + 1
+            if index in bin_range:
+                tmp = m.weight.data.clone()
+                saved_params.append(tmp)
+                target_modules.append(m.weight)
     # Optimizer
     nbs = 64  # nominal batch size
     accumulate = max(round(nbs / batch_size), 1)  # accumulate loss before optimizing
@@ -410,7 +429,24 @@ def train(hyp, opt, device, callbacks):
 
             # Forward
             with torch.cuda.amp.autocast(amp):
-                bin_op.binarization()
+            
+                for index in range(num_of_params):
+                    s = target_modules[index].data.size()
+                    negMean = target_modules[index].data.mean(1, keepdim=True).\
+                            mul(-1).expand_as(target_modules[index].data)
+                    target_modules[index].data = target_modules[index].data.add(negMean)
+                for index in range(num_of_params):
+                    target_modules[index].data = \
+                            target_modules[index].data.clamp(-1.0, 1.0)
+                for index in range(num_of_params):
+                    saved_params[index].copy_(target_modules[index].data)
+                for index in range(num_of_params):
+                    n = target_modules[index].data[0].nelement()
+                    s = target_modules[index].data.size()
+                    m = target_modules[index].data.norm(1, 3, keepdim=True)\
+                            .sum(2, keepdim=True).sum(1, keepdim=True).div(n)
+                    target_modules[index].data = \
+                            target_modules[index].data.sign().mul(m.expand(s))
                 pred = model(imgs)  # forward
                 loss, loss_items = compute_loss(pred, targets.to(device))  # loss scaled by batch_size
                 if RANK != -1:
@@ -420,8 +456,25 @@ def train(hyp, opt, device, callbacks):
 
             # Backward
             scaler.scale(loss).backward()
-            bin_op.restore()
-            bin_op.updateBinaryGradWeight()
+            for index in range(num_of_params):
+                target_modules[index].data.copy_(saved_params[index])
+            for index in range(num_of_params):
+                weight = target_modules[index].data
+                n = weight[0].nelement()
+                s = weight.size()
+                m = weight.norm(1, 3, keepdim=True)\
+                        .sum(2, keepdim=True).sum(1, keepdim=True).div(n).expand(s)
+                m[weight.lt(-1.0)] = 0 
+                m[weight.gt(1.0)] = 0
+                # m = m.add(1.0/n).mul(1.0-1.0/s[1]).mul(n)
+                # target_modules[index].grad.data = \
+                #         target_modules[index].grad.data.mul(m)
+                m = m.mul(target_modules[index].grad.data)
+                m_add = weight.sign().mul(target_modules[index].grad.data)
+                m_add = m_add.sum(3, keepdim=True)\
+                        .sum(2, keepdim=True).sum(1, keepdim=True).div(n).expand(s)
+                m_add = m_add.mul(weight.sign())
+                target_modules[index].grad.data = m.add(m_add).mul(1.0-1.0/s[1]).mul(n)
             # Optimize - https://pytorch.org/docs/master/notes/amp_examples.html
             if ni - last_opt_step >= accumulate:
                 scaler.unscale_(optimizer)  # unscale gradients
@@ -477,7 +530,23 @@ def train(hyp, opt, device, callbacks):
                 best_fitness = fi
             log_vals = list(mloss) + list(results) + lr
             callbacks.run("on_fit_epoch_end", log_vals, epoch, best_fitness, fi)
-
+            for index in range(num_of_params):
+                    s = target_modules[index].data.size()
+                    negMean = target_modules[index].data.mean(1, keepdim=True).\
+                            mul(-1).expand_as(target_modules[index].data)
+                    target_modules[index].data = target_modules[index].data.add(negMean)
+            for index in range(num_of_params):
+                target_modules[index].data = \
+                        target_modules[index].data.clamp(-1.0, 1.0)
+            for index in range(num_of_params):
+                saved_params[index].copy_(target_modules[index].data)
+            for index in range(num_of_params):
+                n = target_modules[index].data[0].nelement()
+                s = target_modules[index].data.size()
+                m = target_modules[index].data.norm(1, 3, keepdim=True)\
+                        .sum(2, keepdim=True).sum(1, keepdim=True).div(n)
+                target_modules[index].data = \
+                        target_modules[index].data.sign().mul(m.expand(s))
             # Save model
             if (not nosave) or (final_epoch and not evolve):  # if save
                 ckpt = {
